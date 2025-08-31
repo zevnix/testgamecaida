@@ -1,2 +1,3 @@
-# testgamecaida
-gamecaida
+# ACTUALIZACIÓN
+
+GAME VERSION 1.0.1
