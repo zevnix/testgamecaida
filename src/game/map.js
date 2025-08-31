@@ -1,13 +1,12 @@
 // /src/game/map.js
 // Mapa destructible con “búnker” (Maduro) oculto.
-//
 // API pública:
-//   - setMapLevel(level)     → aplica opciones del nivel al mapa (bloques, HP, flash, seed)
-//   - resizeMap(w, h)        → recalcula columnas/filas según el canvas
-//   - buildMap()             → genera las tiles y coloca el búnker
-//   - drawMap(ctx, isActive) → dibuja el mapa; el búnker parpadea brevemente cada ciclo.
-//                              Si isActive=false (pausa/victoria/gameover) el flash se congela.
-//   - bulletHitTile(b, spc)  → aplica daño, destruye bloque, devuelve: "hit" | "break" | "bunker" | false
+//   setMapLevel(level)      → aplica opciones del nivel al mapa (bloques, HP, flash, seed)
+//   resizeMap(w, h)         → recalcula columnas/filas según el canvas
+//   buildMap()              → genera las tiles y coloca el búnker
+//   drawMap(ctx)            → dibuja el mapa (respeta “congelado”)
+//   bulletHitTile(b, spc)   → aplica daño y retorna "hit" | "break" | "bunker" | false
+//   setFlashFrozen(boolean) → detiene/reanuda el ciclo de parpadeo del búnker
 
 export const MAP = {
   TILE: 26,
@@ -17,27 +16,25 @@ export const MAP = {
   bunkerRC: null,       // [r,c] del bunker si existe
 
   // defaults si el nivel no provee nada
-  density: 0.16,        // probabilidad base de ocupar celdas
+  density: 0.16,
   tileHP: 2,
 
   // opciones del nivel vigente (si las hay)
   levelOpts: null,      // { targetBlocks, tileHP, flashEverySec, flashDurMs, seed }
 
-  // comportamiento del “flash” (pista visual del búnker)
+  // parpadeo del búnker
   flashEverySec: 12,
   flashDurMs: 180,
-  _lastFlashMs: 0,      // inicio de la ventana de flash
+  _lastFlashMs: 0,
+
+  // FREEZE del parpadeo (para pausa / victoria / game over)
+  _flashFrozen: false,
+  _freezeStartMs: 0,
 };
 
-//
-// Utilidades
-//
-const nowMs = () =>
-  (typeof performance !== "undefined" && performance.now)
-    ? performance.now()
-    : Date.now();
+const nowMs = () => (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
 
-// PRNG simple (xorshift32) para reproducibilidad
+// PRNG simple (xorshift32)
 function makeRng(seed) {
   let x = (seed | 0) || 123456789;
   return () => {
@@ -55,33 +52,24 @@ function clampInt(n, min, max) {
   return n;
 }
 
-// Cuenta bloques actuales (tiles no nulas)
 function countBlocks() {
   let n = 0;
   for (let r = 0; r < MAP.tiles.length; r++) {
     const row = MAP.tiles[r];
     if (!row) continue;
-    for (let c = 0; c < row.length; c++) {
-      if (row[c]) n++;
-    }
+    for (let c = 0; c < row.length; c++) if (row[c]) n++;
   }
   return n;
 }
 
-//
-// API de nivel
-//
+// --------------- nivel ---------------
 export function setMapLevel(level) {
-  // Puede venir desde levels.js → level.map / level.bunker
   const targetBlocks = Number(level?.map?.destructibleBlocks ?? 50);
   const tileHP       = Number(level?.map?.tileHP ?? 2);
-
-  // Parámetros de parpadeo del búnker
   const flashEvery   = Number(level?.bunker?.flashEverySec ?? 12);
   const flashDur     = Number(level?.bunker?.flashDurMs ?? 180);
 
-  // Seed reproducible: preferimos id del nivel; mezclamos con el tiempo para variedad
-  const seedBase = (level?.id ?? 0) ^ 0x9e3779b9; // golden ratio constant
+  const seedBase = (level?.id ?? 0) ^ 0x9e3779b9;
   const seed     = (seedBase ^ Date.now()) | 0;
 
   MAP.levelOpts = {
@@ -97,9 +85,25 @@ export function setMapLevel(level) {
   MAP.flashDurMs    = MAP.levelOpts.flashDurMs;
 }
 
-//
-// Tamaño del mapa
-//
+// --------------- FREEZE del flash ---------------
+export function setFlashFrozen(frozen) {
+  if (frozen) {
+    if (!MAP._flashFrozen) {
+      MAP._flashFrozen = true;
+      MAP._freezeStartMs = nowMs();
+    }
+  } else {
+    if (MAP._flashFrozen) {
+      const pausedDelta = nowMs() - MAP._freezeStartMs;
+      // “corremos” el origen para que el ciclo retome donde quedó
+      MAP._lastFlashMs += pausedDelta;
+      MAP._flashFrozen = false;
+      MAP._freezeStartMs = 0;
+    }
+  }
+}
+
+// --------------- tamaño / construcción ---------------
 export function resizeMap(w, h) {
   const cols = Math.max(6, Math.floor(w / MAP.TILE));
   const rows = Math.max(6, Math.floor((h * 0.70) / MAP.TILE));
@@ -107,9 +111,6 @@ export function resizeMap(w, h) {
   MAP.ROWS = rows;
 }
 
-//
-// Construcción del mapa
-//
 export function buildMap() {
   const { COLS, ROWS } = MAP;
   MAP.tiles = [];
@@ -117,7 +118,6 @@ export function buildMap() {
 
   if (COLS <= 0 || ROWS <= 0) return;
 
-  // Espacio útil (evitamos bordes para estética y para no pegarse a los límites)
   const usableCols = Math.max(0, COLS - 2);
   const usableRows = Math.max(0, ROWS - 4);
   const totalCells = usableCols * usableRows;
@@ -126,13 +126,9 @@ export function buildMap() {
     ? clampInt(MAP.levelOpts.targetBlocks, 0, totalCells)
     : clampInt(Math.floor(totalCells * MAP.density), 0, totalCells);
 
-  // RNG reproducible (o aleatorio si no hay levelOpts)
   const rng = makeRng(MAP.levelOpts?.seed ?? Math.floor(Math.random() * 1e9));
-
-  // Probabilidad base para aproximar target
   const p = totalCells > 0 ? (target / totalCells) : 0;
 
-  // Rellena por probabilidad
   for (let r = 0; r < ROWS; r++) MAP.tiles[r] = [];
   for (let r = 2; r < ROWS - 2; r++) {
     const row = MAP.tiles[r];
@@ -141,7 +137,6 @@ export function buildMap() {
     }
   }
 
-  // Si quedó por debajo del target, añadimos bloques extra en huecos aleatorios
   let current = countBlocks();
   let deficit = target - current;
   if (deficit > 0) {
@@ -156,11 +151,11 @@ export function buildMap() {
     }
   }
 
-  // Colocar búnker en un bloque existente; si no hay ninguno, no habrá búnker
   placeBunker(rng);
 
-  // Reset del ciclo de flash
+  // reset del ciclo de flash
   MAP._lastFlashMs = nowMs();
+  setFlashFrozen(false); // por si veníamos de una pausa o fin de partida
 }
 
 function placeBunker(rng) {
@@ -168,57 +163,42 @@ function placeBunker(rng) {
   for (let r = 0; r < MAP.tiles.length; r++) {
     const row = MAP.tiles[r];
     if (!row) continue;
-    for (let c = 0; c < row.length; c++) {
-      if (row[c]) candidates.push([r, c]);
-    }
+    for (let c = 0; c < row.length; c++) if (row[c]) candidates.push([r, c]);
   }
-  if (candidates.length === 0) {
-    MAP.bunkerRC = null;
-    return;
-  }
+  if (!candidates.length) { MAP.bunkerRC = null; return; }
   const [br, bc] = candidates[Math.floor(rng() * candidates.length)];
   MAP.tiles[br][bc].bunker = true;
-  MAP.tiles[br][bc].hp = (MAP.tileHP || 2) + 2; // un pelín más duro
+  MAP.tiles[br][bc].hp = (MAP.tileHP || 2) + 2;
   MAP.bunkerRC = [br, bc];
 }
 
-//
-// Dibujo
-//
-export function drawMap(ctx, isActive = true) {
+// --------------- dibujo ---------------
+export function drawMap(ctx) {
   const s = MAP.TILE - 3;
 
-  // Control del “flash” (si el juego no está activo, el flash queda congelado)
-  const now = nowMs();
+  // Si estamos “congelados”, usamos el instante del congelado para que el
+  // parpadeo quede quieto.
+  const now = MAP._flashFrozen ? MAP._freezeStartMs : nowMs();
+
   const elapsed = now - MAP._lastFlashMs;
   const flashing = elapsed <= MAP.flashDurMs;
-
-  if (isActive) {
-    if (elapsed > MAP.flashEverySec * 1000) {
-      MAP._lastFlashMs = now;
-    }
+  if (!MAP._flashFrozen && elapsed > MAP.flashEverySec * 1000) {
+    MAP._lastFlashMs = now;
   }
 
   for (let r = 0; r < MAP.tiles.length; r++) {
-    const row = MAP.tiles[r];
-    if (!row) continue;
-
+    const row = MAP.tiles[r]; if (!row) continue;
     for (let c = 0; c < row.length; c++) {
-      const t = row[c];
-      if (!t) continue;
+      const t = row[c]; if (!t) continue;
 
       const x = c * MAP.TILE + MAP.TILE * 0.5;
       const y = r * MAP.TILE + MAP.TILE * 0.5;
 
-      // base
       ctx.fillStyle = "#1b2a4c";
       ctx.strokeStyle = "#0f1a34";
       ctx.lineWidth = 1;
 
-      // si es bunker y justo ahora toca flash, resaltamos
-      if (t.bunker && flashing) {
-        ctx.fillStyle = "#36e27a"; // verde brillante temporal
-      }
+      if (t.bunker && flashing) ctx.fillStyle = "#36e27a";
 
       ctx.fillRect(x - s / 2, y - s / 2, s, s);
       ctx.strokeRect(x - s / 2, y - s / 2, s, s);
@@ -226,30 +206,22 @@ export function drawMap(ctx, isActive = true) {
   }
 }
 
-//
-// Colisión bala ↔ bloque
-//
+// --------------- colisión bala ↔ bloque ---------------
 export function bulletHitTile(b, special = false) {
   const c = Math.floor(b.x / MAP.TILE);
   const r = Math.floor(b.y / MAP.TILE);
 
-  // fuera del mapa
   if (r < 0 || r >= MAP.tiles.length) return false;
-  const row = MAP.tiles[r];
-  if (!row) return false;
-  if (c < 0 || c >= row.length) return false;
+  if (c < 0 || c >= (MAP.tiles[r]?.length ?? 0)) return false;
 
-  const t = row[c];
-  if (!t) return false;
+  const t = MAP.tiles[r][c]; if (!t) return false;
 
-  // daño
-  const dmg = special ? 3 : 1;
-  t.hp -= dmg;
+  t.hp -= (special ? 3 : 1);
   b.dead = true;
 
   if (t.hp <= 0) {
     const isBunker = !!t.bunker;
-    row[c] = null;
+    MAP.tiles[r][c] = null;
     return isBunker ? "bunker" : "break";
   }
   return "hit";
